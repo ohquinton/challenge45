@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
 const START_DATE = new Date(2026, 2, 29); // March 29
 
@@ -42,6 +42,66 @@ const CATEGORY_LABELS = {
   doc: "LOG",
 };
 
+// --- IndexedDB helpers for photo vault ---
+const DB_NAME = "challenge45_photos";
+const DB_VERSION = 1;
+const STORE_NAME = "photos";
+
+function openPhotoDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: "day" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function savePhoto(day, dataUrl) {
+  const db = await openPhotoDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put({ day, dataUrl, timestamp: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getPhoto(day) {
+  const db = await openPhotoDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).get(day);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getAllPhotos() {
+  const db = await openPhotoDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function deletePhoto(day) {
+  const db = await openPhotoDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).delete(day);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// --- Helpers ---
 function getDayLabel(dayIndex) {
   const d = new Date(START_DATE);
   d.setDate(d.getDate() + dayIndex);
@@ -52,20 +112,53 @@ function getWeekNumber(dayIndex) {
   return Math.floor(dayIndex / 7);
 }
 
+function getCurrentDayIndex() {
+  const now = new Date();
+  const diff = Math.floor((now - START_DATE) / (1000 * 60 * 60 * 24));
+  return Math.max(0, Math.min(diff, 44));
+}
+
 export default function App() {
   const [completions, setCompletions] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem("challenge45_completions") || "{}");
     } catch { return {}; }
   });
-  const [selectedDay, setSelectedDay] = useState(0);
-  const [view, setView] = useState("today"); // today | week | calendar
+  const [selectedDay, setSelectedDay] = useState(() => getCurrentDayIndex());
+  const [view, setView] = useState("today"); // today | week | calendar | vault
+  const [photoForDay, setPhotoForDay] = useState(null); // cached photo data url for selected day
+  const [vaultPhotos, setVaultPhotos] = useState([]);
+  const [vaultPreview, setVaultPreview] = useState(null); // day index for fullscreen preview
+  const fileInputRef = useRef(null);
+  const daySelectorRef = useRef(null);
 
   useEffect(() => {
     try {
       localStorage.setItem("challenge45_completions", JSON.stringify(completions));
     } catch {}
   }, [completions]);
+
+  // Load photo for selected day
+  useEffect(() => {
+    let cancelled = false;
+    getPhoto(selectedDay).then(p => { if (!cancelled) setPhotoForDay(p ? p.dataUrl : null); });
+    return () => { cancelled = true; };
+  }, [selectedDay, completions]);
+
+  // Load vault photos when entering vault view
+  useEffect(() => {
+    if (view === "vault") {
+      getAllPhotos().then(setVaultPhotos);
+    }
+  }, [view]);
+
+  // Auto-scroll day selector to current day on mount
+  useEffect(() => {
+    if (daySelectorRef.current) {
+      const btn = daySelectorRef.current.children[selectedDay];
+      if (btn) btn.scrollIntoView({ inline: "center", behavior: "instant" });
+    }
+  }, []);
 
   function toggleTask(day, taskId) {
     const key = `${day}_${taskId}`;
@@ -80,12 +173,54 @@ export default function App() {
     return DAILY_TASKS.filter(t => completions[`${day}_${t.id}`]).length;
   }
 
+  const handlePhotoCapture = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // Resize to save storage — max 800px wide
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxW = 800;
+        const scale = img.width > maxW ? maxW / img.width : 1;
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+        savePhoto(selectedDay, dataUrl).then(() => {
+          setPhotoForDay(dataUrl);
+          // Auto-check the photo task
+          const key = `${selectedDay}_photo`;
+          setCompletions(prev => ({ ...prev, [key]: true }));
+        });
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+    // Reset input so same file can be re-selected
+    e.target.value = "";
+  }, [selectedDay]);
+
+  const handleDeletePhoto = useCallback(async (day) => {
+    await deletePhoto(day);
+    if (day === selectedDay) setPhotoForDay(null);
+    setVaultPhotos(prev => prev.filter(p => p.day !== day));
+    // Uncheck photo task
+    const key = `${day}_photo`;
+    setCompletions(prev => ({ ...prev, [key]: false }));
+  }, [selectedDay]);
+
   // Calculate current streak
   let streak = 0;
   for (let i = 0; i < 45; i++) {
     if (isDayComplete(i)) streak++;
     else break;
   }
+
+  // Overall progress
+  const totalCompleted = Array.from({ length: 45 }, (_, i) => i).filter(isDayComplete).length;
 
   const todayProgress = getDayProgress(selectedDay);
   const todayPercent = Math.round((todayProgress / DAILY_TASKS.length) * 100);
@@ -107,6 +242,16 @@ export default function App() {
       margin: "0 auto",
     }}>
 
+      {/* Hidden file input for camera */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handlePhotoCapture}
+        style={{ display: "none" }}
+      />
+
       {/* Header */}
       <div style={{ marginBottom: 28 }}>
         <div style={{ fontSize: 11, letterSpacing: 4, color: "#555", marginBottom: 4 }}>QUINTON /</div>
@@ -116,7 +261,7 @@ export default function App() {
         <div style={{ fontSize: 28, fontWeight: 900, letterSpacing: -1, color: "#ef4444", lineHeight: 1 }}>
           HARD LOCK
         </div>
-        <div style={{ marginTop: 12, display: "flex", gap: 16, alignItems: "center" }}>
+        <div style={{ marginTop: 12, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{
             background: streak > 0 ? "#ef4444" : "#1a1a1a",
             color: streak > 0 ? "#fff" : "#444",
@@ -128,27 +273,27 @@ export default function App() {
             🔥 {streak} DAY STREAK
           </div>
           <div style={{ fontSize: 11, color: "#555" }}>
-            {45 - streak} REMAINING
+            {totalCompleted}/45 COMPLETE
           </div>
         </div>
       </div>
 
       {/* View Toggle */}
       <div style={{ display: "flex", gap: 2, marginBottom: 24 }}>
-        {["today", "week", "calendar"].map(v => (
+        {["today", "week", "calendar", "vault"].map(v => (
           <button key={v} onClick={() => setView(v)} style={{
             flex: 1,
             padding: "8px",
-            background: view === v ? "#ef4444" : "#111",
+            background: view === v ? (v === "vault" ? "#6b7280" : "#ef4444") : "#111",
             color: view === v ? "#fff" : "#555",
-            border: "1px solid " + (view === v ? "#ef4444" : "#222"),
-            fontSize: 11,
+            border: "1px solid " + (view === v ? (v === "vault" ? "#6b7280" : "#ef4444") : "#222"),
+            fontSize: 10,
             fontWeight: 700,
-            letterSpacing: 3,
+            letterSpacing: 2,
             cursor: "pointer",
             textTransform: "uppercase",
           }}>
-            {v}
+            {v === "vault" ? "📸 vault" : v}
           </button>
         ))}
       </div>
@@ -158,22 +303,27 @@ export default function App() {
           {/* Day Selector */}
           <div style={{ marginBottom: 20 }}>
             <div style={{ fontSize: 11, color: "#555", letterSpacing: 3, marginBottom: 10 }}>SELECT DAY</div>
-            <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4 }}>
-              {Array.from({ length: 45 }, (_, i) => (
-                <button key={i} onClick={() => setSelectedDay(i)} style={{
-                  minWidth: 40,
-                  height: 40,
-                  background: selectedDay === i ? "#ef4444" : isDayComplete(i) ? "#1a3a1a" : "#111",
-                  color: selectedDay === i ? "#fff" : isDayComplete(i) ? "#4ade80" : "#444",
-                  border: "1px solid " + (selectedDay === i ? "#ef4444" : isDayComplete(i) ? "#166534" : "#222"),
-                  fontSize: 11,
-                  fontWeight: 700,
-                  cursor: "pointer",
-                  flexShrink: 0,
-                }}>
-                  {i + 1}
-                </button>
-              ))}
+            <div ref={daySelectorRef} style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4 }}>
+              {Array.from({ length: 45 }, (_, i) => {
+                const isCurrent = i === getCurrentDayIndex();
+                return (
+                  <button key={i} onClick={() => setSelectedDay(i)} style={{
+                    minWidth: 40,
+                    height: 40,
+                    background: selectedDay === i ? "#ef4444" : isDayComplete(i) ? "#1a3a1a" : "#111",
+                    color: selectedDay === i ? "#fff" : isDayComplete(i) ? "#4ade80" : "#444",
+                    border: isCurrent && selectedDay !== i
+                      ? "2px solid #ef444488"
+                      : "1px solid " + (selectedDay === i ? "#ef4444" : isDayComplete(i) ? "#166534" : "#222"),
+                    fontSize: 11,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    flexShrink: 0,
+                  }}>
+                    {i + 1}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -216,41 +366,102 @@ export default function App() {
               </div>
               {tasks.map(task => {
                 const done = !!completions[`${selectedDay}_${task.id}`];
+                const isPhotoTask = task.id === "photo";
                 return (
-                  <div key={task.id} onClick={() => toggleTask(selectedDay, task.id)} style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 12,
-                    padding: "10px 12px",
-                    marginBottom: 4,
-                    background: done ? "#0d1f0d" : "#111",
-                    border: `1px solid ${done ? "#166534" : "#1a1a1a"}`,
-                    cursor: "pointer",
-                    transition: "all 0.15s",
-                  }}>
-                    <div style={{
-                      width: 18,
-                      height: 18,
-                      border: `2px solid ${done ? "#4ade80" : "#333"}`,
-                      background: done ? "#4ade80" : "transparent",
+                  <div key={task.id}>
+                    <div onClick={() => {
+                      if (isPhotoTask && !done) {
+                        // Open camera instead of just toggling
+                        fileInputRef.current?.click();
+                      } else {
+                        toggleTask(selectedDay, task.id);
+                      }
+                    }} style={{
                       display: "flex",
                       alignItems: "center",
-                      justifyContent: "center",
-                      flexShrink: 0,
-                      fontSize: 10,
+                      gap: 12,
+                      padding: "10px 12px",
+                      marginBottom: isPhotoTask && photoForDay ? 0 : 4,
+                      background: done ? "#0d1f0d" : "#111",
+                      border: `1px solid ${done ? "#166534" : "#1a1a1a"}`,
+                      cursor: "pointer",
+                      transition: "all 0.15s",
                     }}>
-                      {done ? "✓" : ""}
+                      <div style={{
+                        width: 18,
+                        height: 18,
+                        border: `2px solid ${done ? "#4ade80" : "#333"}`,
+                        background: done ? "#4ade80" : "transparent",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        flexShrink: 0,
+                        fontSize: 10,
+                      }}>
+                        {done ? "✓" : ""}
+                      </div>
+                      <span style={{ fontSize: 11 }}>{task.icon}</span>
+                      <span style={{
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: done ? "#4ade80" : "#ccc",
+                        textDecoration: done ? "line-through" : "none",
+                        letterSpacing: 0.5,
+                        flex: 1,
+                      }}>
+                        {task.label}
+                      </span>
+                      {isPhotoTask && (
+                        <span
+                          onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                          style={{
+                            fontSize: 9,
+                            letterSpacing: 1,
+                            color: "#6b7280",
+                            border: "1px solid #333",
+                            padding: "2px 8px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {done ? "RETAKE" : "SNAP"}
+                        </span>
+                      )}
                     </div>
-                    <span style={{ fontSize: 11 }}>{task.icon}</span>
-                    <span style={{
-                      fontSize: 12,
-                      fontWeight: 600,
-                      color: done ? "#4ade80" : "#ccc",
-                      textDecoration: done ? "line-through" : "none",
-                      letterSpacing: 0.5,
-                    }}>
-                      {task.label}
-                    </span>
+                    {/* Photo preview thumbnail */}
+                    {isPhotoTask && photoForDay && (
+                      <div style={{
+                        marginBottom: 4,
+                        padding: "8px 12px",
+                        background: "#0d1f0d",
+                        borderLeft: "1px solid #166534",
+                        borderRight: "1px solid #166534",
+                        borderBottom: "1px solid #166534",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 12,
+                      }}>
+                        <img
+                          src={photoForDay}
+                          alt={`Day ${selectedDay + 1}`}
+                          style={{
+                            width: 48, height: 48, objectFit: "cover",
+                            border: "1px solid #166534",
+                          }}
+                        />
+                        <span style={{ fontSize: 10, color: "#4ade80", letterSpacing: 1 }}>
+                          DAY {selectedDay + 1} CAPTURED
+                        </span>
+                        <span
+                          onClick={() => setView("vault")}
+                          style={{
+                            marginLeft: "auto", fontSize: 9, color: "#6b7280",
+                            border: "1px solid #333", padding: "2px 8px", cursor: "pointer",
+                          }}
+                        >
+                          VAULT
+                        </span>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -455,6 +666,126 @@ export default function App() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* PHOTO VAULT VIEW */}
+      {view === "vault" && (
+        <div>
+          <div style={{ fontSize: 11, color: "#6b7280", letterSpacing: 3, marginBottom: 16 }}>
+            PROGRESS PHOTO VAULT
+          </div>
+
+          {vaultPhotos.length === 0 ? (
+            <div style={{
+              padding: 40, textAlign: "center",
+              border: "1px dashed #333", background: "#111",
+            }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}>📸</div>
+              <div style={{ fontSize: 12, color: "#555", marginBottom: 8 }}>NO PHOTOS YET</div>
+              <div style={{ fontSize: 10, color: "#333" }}>
+                Tap "Progress Photo" on any day to capture
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Photo count */}
+              <div style={{ fontSize: 10, color: "#444", marginBottom: 16, letterSpacing: 2 }}>
+                {vaultPhotos.length} PHOTO{vaultPhotos.length !== 1 ? "S" : ""} CAPTURED
+              </div>
+
+              {/* Photo grid */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4 }}>
+                {vaultPhotos
+                  .sort((a, b) => a.day - b.day)
+                  .map(photo => (
+                    <div key={photo.day} onClick={() => setVaultPreview(photo.day)} style={{
+                      position: "relative", cursor: "pointer",
+                      aspectRatio: "1", overflow: "hidden",
+                      border: "1px solid #222",
+                    }}>
+                      <img
+                        src={photo.dataUrl}
+                        alt={`Day ${photo.day + 1}`}
+                        style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                      />
+                      <div style={{
+                        position: "absolute", bottom: 0, left: 0, right: 0,
+                        background: "linear-gradient(transparent, #000a)",
+                        padding: "12px 6px 4px",
+                        fontSize: 9, fontWeight: 700, color: "#fff",
+                        letterSpacing: 2,
+                      }}>
+                        DAY {photo.day + 1}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+
+              {/* Side-by-side compare hint */}
+              {vaultPhotos.length >= 2 && (
+                <div style={{
+                  marginTop: 16, padding: 12,
+                  border: "1px solid #222", background: "#111",
+                  fontSize: 10, color: "#444", textAlign: "center", letterSpacing: 1,
+                }}>
+                  TAP ANY PHOTO TO VIEW FULL SIZE
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Fullscreen preview overlay */}
+          {vaultPreview !== null && (() => {
+            const photo = vaultPhotos.find(p => p.day === vaultPreview);
+            if (!photo) return null;
+            return (
+              <div onClick={() => setVaultPreview(null)} style={{
+                position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+                background: "#000e", zIndex: 100,
+                display: "flex", flexDirection: "column",
+                alignItems: "center", justifyContent: "center",
+                padding: 16,
+              }}>
+                <div style={{
+                  fontSize: 11, letterSpacing: 4, color: "#fff",
+                  marginBottom: 12, fontWeight: 700,
+                }}>
+                  DAY {photo.day + 1} — {getDayLabel(photo.day).toUpperCase()}
+                </div>
+                <img
+                  src={photo.dataUrl}
+                  alt={`Day ${photo.day + 1}`}
+                  style={{
+                    maxWidth: "100%", maxHeight: "70vh",
+                    objectFit: "contain", border: "2px solid #333",
+                  }}
+                />
+                <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+                  <button onClick={(e) => {
+                    e.stopPropagation();
+                    if (confirm(`Delete Day ${photo.day + 1} photo?`)) {
+                      handleDeletePhoto(photo.day);
+                      setVaultPreview(null);
+                    }
+                  }} style={{
+                    fontSize: 10, letterSpacing: 2, padding: "6px 16px",
+                    background: "#1a0000", border: "1px solid #ef444488",
+                    color: "#ef4444", cursor: "pointer",
+                  }}>
+                    DELETE
+                  </button>
+                  <button onClick={(e) => { e.stopPropagation(); setVaultPreview(null); }} style={{
+                    fontSize: 10, letterSpacing: 2, padding: "6px 16px",
+                    background: "#111", border: "1px solid #333",
+                    color: "#ccc", cursor: "pointer",
+                  }}>
+                    CLOSE
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
 
