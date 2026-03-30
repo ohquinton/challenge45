@@ -170,7 +170,7 @@ function PinScreen({ mode, onSuccess }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [shaking, setShaking] = useState(false);
-  const maxLen = 6;
+  const maxLen = 4;
 
   const handleDigit = (d) => {
     if (pin.length >= maxLen || loading) return;
@@ -336,7 +336,7 @@ function PinScreen({ mode, onSuccess }) {
           letterSpacing: 1, maxWidth: 240, lineHeight: 1.6,
           animation: "fadeSlideUp 0.4s ease 0.3s both",
         }}>
-          CHOOSE A 6-DIGIT PIN TO LOCK YOUR CHALLENGE
+          CHOOSE A 4-DIGIT PIN TO LOCK YOUR CHALLENGE
         </div>
       )}
 
